@@ -3,10 +3,10 @@
 ![ESP32](https://img.shields.io/badge/ESP32-FF6600?style=for-the-badge&logo=espressif&logoColor=white)
 ![Arduino](https://img.shields.io/badge/Arduino-00979D?style=for-the-badge&logo=arduino&logoColor=white)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-1A1A1A?style=for-the-badge&logo=platformio&logoColor=00A8FF)
-![License](https://img.shields.io/github/license/meteo/esp32cam_project?style=for-the-badge)
-![Issues](https://img.shields.io/github/issues/meteo/esp32cam_project?style=for-the-badge)
-![Forks](https://img.shields.io/github/forks/meteo/esp32cam_project?style=for-the-badge)
-![Stars](https://img.shields.io/github/stars/meteo/esp32cam_project?style=for-the-badge)
+![License](https://img.shields.io/github/license/f2re/esp32cam?style=for-the-badge)
+![Issues](https://img.shields.io/github/issues/f2re/esp32cam?style=for-the-badge)
+![Forks](https://img.shields.io/github/forks/f2re/esp32cam?style=for-the-badge)
+![Stars](https://img.shields.io/github/stars/f2re/esp32cam?style=for-the-badge)
 
 ## 📖 Описание проекта
 
