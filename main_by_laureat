@@ -1,0 +1,192 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ================= КОНФИГУРАЦИЯ СЕТИ =================
+const char* ssid = "Raspberry";         // Имя сети Raspberry Pi
+const char* password = "12345678"; // Пароль сети
+String serverName = "http://10.42.0.1:5000/upload"; // Адрес сервера (IP Raspberry)
+
+// ================= НАСТРОЙКИ ТАЙМЕРА =================
+#define uS_TO_S_FACTOR 1000000ULL  /* Коэффициент перевода микросекунд в секунды */
+#define TIME_TO_SLEEP  600         /* Время сна в секундах (10 минут = 600 с) */
+
+// ================= ПИНЫ (AI-THINKER ESP32-CAM) =======
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+
+  // 1. Настройка Deep Sleep таймера
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+
+  // 2. Настройка камеры для OV5640
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG; 
+  
+  // Для OV5640 и PSRAM (обязательно для высокого разрешения)
+  if(psramFound()){
+    config.frame_size = FRAMESIZE_UXGA; // 1600x1200. Можно ставить выше (QSXGA), но будет дольше передаваться
+    config.jpeg_quality = 10;           // 0-63, чем меньше число, тем выше качество
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST; // Важно для актуального снимка
+  } else {
+    // Если PSRAM нет, снижаем качество
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  // Инициализация камеры
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    // Если камера не стартанула, уходим в сон и пробуем через 10 мин снова
+    esp_deep_sleep_start(); 
+  }
+
+  // Специальные настройки для OV5640 (автофокус, если поддерживается, и баланс белого)
+  sensor_t * s = esp_camera_sensor_get();
+  // s->set_brightness(s, 1);  // Можно подкрутить яркость (от -2 до 2)
+
+  // 3. Подключение к Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi...");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" Connected!");
+    
+    // Даем камере и сенсорам стабилизироваться (баланс белого/экспозиция)
+    delay(2000); 
+
+    // 4. Делаем снимок
+    // Иногда первый кадр бывает "зеленым" или с плохим балансом белого,
+    // поэтому можно сделать один "холостой" кадр.
+    camera_fb_t * fb = esp_camera_fb_get();
+    esp_camera_fb_return(fb); // Сбрасываем первый
+    fb = esp_camera_fb_get(); // Берем второй
+
+    if(!fb) {
+      Serial.println("Camera capture failed");
+    } else {
+      // 5. Отправка на сервер
+      Serial.printf("Picture taken! Size: %d bytes\n", fb->len);
+      sendPhoto(fb);
+      esp_camera_fb_return(fb);
+    }
+  } else {
+    Serial.println("WiFi Connection failed.");
+  }
+
+  // 6. Уход в глубокий сон
+  Serial.println("Going to sleep now");
+  Serial.flush(); 
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  // Loop пустой, так как после Deep Sleep контроллер перезагружается и начинает с setup()
+}
+
+void sendPhoto(camera_fb_t * fb) {
+  HTTPClient http;
+
+  Serial.print("Beginning upload to: ");
+  Serial.println(serverName);
+
+  // Начинаем соединение
+  http.begin(serverName);
+
+  // Формируем границы (boundary) для Multipart данных
+  String boundary = "--------------------------Ef1e623271813659";
+  String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"imageFile\"; filename=\"esp32-cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  // Вычисляем общий размер данных
+  uint32_t imageLen = fb->len;
+  uint32_t extraLen = head.length() + tail.length();
+  uint32_t totalLen = imageLen + extraLen;
+
+  // Добавляем заголовки, чтобы сервер понял, что это за данные
+  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  http.addHeader("Content-Length", String(totalLen));
+
+  // Выделяем память под весь пакет данных
+  uint8_t *dataBuffer = (uint8_t *)malloc(totalLen);
+  
+  if(dataBuffer) {
+     // 1. Копируем заголовок в начало буфера (с приведением типа к uint8_t*)
+     memcpy(dataBuffer, (uint8_t*)head.c_str(), head.length());
+     
+     // 2. Копируем само изображение сразу после заголовка
+     memcpy(dataBuffer + head.length(), fb->buf, imageLen);
+     
+     // 3. Копируем "хвост" (закрывающую границу) в конец
+     memcpy(dataBuffer + head.length() + imageLen, (uint8_t*)tail.c_str(), tail.length());
+     
+     // 4. Отправляем весь буфер одним махом
+     int httpResponseCode = http.POST(dataBuffer, totalLen);
+     
+     // Проверяем ответ сервера
+     if (httpResponseCode > 0) {
+       String response = http.getString();
+       Serial.print("Server response code: ");
+       Serial.println(httpResponseCode);
+       Serial.print("Server reply: ");
+       Serial.println(response);
+     } else {
+       Serial.printf("Error occurred while sending: %s\n", http.errorToString(httpResponseCode).c_str());
+     }
+     
+     // Обязательно освобождаем память!
+     free(dataBuffer);
+  } else {
+    Serial.println("Malloc failed: image too large for RAM buffer.");
+  }
+  
+  // Завершаем соединение
+  http.end();
+}
