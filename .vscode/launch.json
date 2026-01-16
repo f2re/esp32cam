@@ -12,9 +12,9 @@
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug",
-            "executable": "/Users/meteo/Documents/WWW/esp32cam_project/.pio/build/esp32cam/firmware.elf",
+            "executable": "c:/Users/Meteo/Documents/esp32cam/.pio/build/esp32cam/firmware.elf",
             "projectEnvName": "esp32cam",
-            "toolchainBinDir": "/Users/meteo/.platformio/packages/toolchain-xtensa-esp32/bin",
+            "toolchainBinDir": "C:/Users/Meteo/.platformio/packages/toolchain-xtensa-esp32/bin",
             "internalConsoleOptions": "openOnSessionStart",
             "preLaunchTask": {
                 "type": "PlatformIO",
@@ -25,18 +25,18 @@
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug (skip Pre-Debug)",
-            "executable": "/Users/meteo/Documents/WWW/esp32cam_project/.pio/build/esp32cam/firmware.elf",
+            "executable": "c:/Users/Meteo/Documents/esp32cam/.pio/build/esp32cam/firmware.elf",
             "projectEnvName": "esp32cam",
-            "toolchainBinDir": "/Users/meteo/.platformio/packages/toolchain-xtensa-esp32/bin",
+            "toolchainBinDir": "C:/Users/Meteo/.platformio/packages/toolchain-xtensa-esp32/bin",
             "internalConsoleOptions": "openOnSessionStart"
         },
         {
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug (without uploading)",
-            "executable": "/Users/meteo/Documents/WWW/esp32cam_project/.pio/build/esp32cam/firmware.elf",
+            "executable": "c:/Users/Meteo/Documents/esp32cam/.pio/build/esp32cam/firmware.elf",
             "projectEnvName": "esp32cam",
-            "toolchainBinDir": "/Users/meteo/.platformio/packages/toolchain-xtensa-esp32/bin",
+            "toolchainBinDir": "C:/Users/Meteo/.platformio/packages/toolchain-xtensa-esp32/bin",
             "internalConsoleOptions": "openOnSessionStart",
             "loadMode": "manual"
         }
