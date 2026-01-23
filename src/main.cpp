@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <time.h>
 #include <esp_task_wdt.h>
+#include <esp_wifi.h>
 
 // ------------------- CONFIG -------------------
 static const char* WIFI_SSID = "Raspberry";
@@ -10,14 +11,13 @@ static const char* WIFI_PASS = "12345678";
 static const char* SERVER_HOST = "192.168.4.1";
 static const uint16_t SERVER_PORT = 8000;
 
-static const char* CAM_ID = "cam160";   // для второй камеры соберите отдельный бинарник с "cam120"
+static const char* CAM_ID = "cam120";   // для второй камеры соберите отдельный бинарник с "cam120"
 
 static const uint32_t CAPTURE_PERIOD_SEC = 600;
 static const uint32_t FAIL_SLEEP_SEC = 120;
 
 static const uint32_t WIFI_TIMEOUT_MS = 30000;
-static const uint32_t WIFI_SCAN_TIMEOUT_MS = 8000;
-static const uint8_t  WIFI_SCAN_ATTEMPTS = 2;
+static const uint8_t  WIFI_CONNECT_ATTEMPTS = 2;
 
 static const uint32_t CMD_TOTAL_WAIT_MS = 50000;
 static const uint32_t ACK_TOTAL_WAIT_MS = 60000;
@@ -38,6 +38,42 @@ static const size_t TCP_WRITE_BLOCK = 1460;
 
 #define LED_FLASH_GPIO   GPIO_NUM_4
 #define STATUS_LED_GPIO  GPIO_NUM_33
+
+// ------------------- WiFi event diagnostics -------------------
+static volatile bool g_wifi_got_ip = false;
+static volatile bool g_wifi_disconnected = false;
+static volatile uint8_t g_wifi_disc_reason = 0;
+
+static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      g_wifi_got_ip = true;
+      Serial.printf("[WIFI][EV] GOT_IP: %s\n", IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      g_wifi_disconnected = true;
+      g_wifi_disc_reason = info.wifi_sta_disconnected.reason;
+      Serial.printf("[WIFI][EV] DISCONNECTED: reason=%u\n", (unsigned)g_wifi_disc_reason);
+      break;
+
+    default:
+      break;
+  }
+}
+
+static const char* wlStatusStr(wl_status_t st) {
+  switch (st) {
+    case WL_IDLE_STATUS:      return "WL_IDLE_STATUS";
+    case WL_NO_SSID_AVAIL:    return "WL_NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED:   return "WL_SCAN_COMPLETED";
+    case WL_CONNECTED:        return "WL_CONNECTED";
+    case WL_CONNECT_FAILED:   return "WL_CONNECT_FAILED";
+    case WL_CONNECTION_LOST:  return "WL_CONNECTION_LOST";
+    case WL_DISCONNECTED:     return "WL_DISCONNECTED";
+    default:                  return "WL_UNKNOWN";
+  }
+}
 
 // ------------------- CRC32 -------------------
 static uint32_t crc32_table[256];
@@ -62,19 +98,6 @@ static uint32_t crc32(const uint8_t *buf, size_t len) {
 
 // ------------------- Helpers -------------------
 static uint32_t ms() { return millis(); }
-
-static const char* wlStatusStr(wl_status_t st) {
-  switch (st) {
-    case WL_IDLE_STATUS:      return "WL_IDLE_STATUS";
-    case WL_NO_SSID_AVAIL:    return "WL_NO_SSID_AVAIL";
-    case WL_SCAN_COMPLETED:   return "WL_SCAN_COMPLETED";
-    case WL_CONNECTED:        return "WL_CONNECTED";
-    case WL_CONNECT_FAILED:   return "WL_CONNECT_FAILED";
-    case WL_CONNECTION_LOST:  return "WL_CONNECTION_LOST";
-    case WL_DISCONNECTED:     return "WL_DISCONNECTED";
-    default:                  return "WL_UNKNOWN";
-  }
-}
 
 static void goToSleep(uint32_t seconds) {
   Serial.printf("[SLEEP] %u sec\n", seconds);
@@ -209,6 +232,7 @@ static void wifiTuneAfterConnect() {
   if (WIFI_MAX_TXPOWER) WiFi.setTxPower(WIFI_POWER_19_5dBm);
 }
 
+// -------- scan + best AP selection --------
 static void printScanResult(int n) {
   Serial.printf("[WIFI] Scan done: %d networks\n", n);
   for (int i = 0; i < n; i++) {
@@ -231,11 +255,7 @@ struct SsidHit {
 
 static SsidHit findBestAPForSSID(const char* targetSsid) {
   SsidHit best;
-  uint32_t t0 = ms();
-
-  // активный scan, чтобы подтвердить WL_NO_SSID_AVAIL фактом видимости [page:0]
   int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
-  (void)t0;
   printScanResult(n);
 
   for (int i = 0; i < n; i++) {
@@ -253,13 +273,8 @@ static SsidHit findBestAPForSSID(const char* targetSsid) {
   return best;
 }
 
-static bool connectWiFiWithScan(uint32_t timeoutMs) {
-  Serial.printf("[WIFI] Connecting to SSID='%s'\n", WIFI_SSID);
-
-  // защититься от перезаписи flash при частых deep sleep [page:0]
-  WiFi.persistent(false);
-
-  // “жёсткий” сброс Wi-Fi стека
+static void wifiHardResetSTA() {
+  WiFi.persistent(false);                  // снижает риск лишних записей во flash при циклах сна [page:0]
   WiFi.disconnect(true);
   delay(200);
   WiFi.mode(WIFI_OFF);
@@ -267,36 +282,44 @@ static bool connectWiFiWithScan(uint32_t timeoutMs) {
   WiFi.mode(WIFI_STA);
 
   WiFi.setAutoReconnect(true);
-  if (WIFI_DISABLE_SLEEP) WiFi.setSleep(false);
 
-  // несколько попыток scan: если SSID не находится, сразу видно, что это RF/инфраструктура, а не HTTP/сервер
-  SsidHit hit;
-  for (uint8_t a = 1; a <= WIFI_SCAN_ATTEMPTS; a++) {
-    Serial.printf("[WIFI] Scan attempt %u/%u ...\n", a, WIFI_SCAN_ATTEMPTS);
-    hit = findBestAPForSSID(WIFI_SSID);
-    if (hit.found) break;
-    delay(300);
+  if (WIFI_DISABLE_SLEEP) {
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);         // более жёстко отключаем power save [page:0]
   }
 
+  if (WIFI_MAX_TXPOWER) WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  g_wifi_got_ip = false;
+  g_wifi_disconnected = false;
+  g_wifi_disc_reason = 0;
+}
+
+static bool connectWiFiOnce(bool lockToBssid) {
+  Serial.printf("[WIFI] Connecting to SSID='%s' lockToBssid=%s\n", WIFI_SSID, lockToBssid ? "true" : "false");
+
+  SsidHit hit = findBestAPForSSID(WIFI_SSID);
   if (hit.found) {
-    Serial.printf("[WIFI] Found SSID='%s': best RSSI=%d ch=%d BSSID=%02X:%02X:%02X:%02X:%02X:%02X\n",
-                  WIFI_SSID, hit.rssi, hit.channel,
+    Serial.printf("[WIFI] Found: RSSI=%d ch=%d BSSID=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                  hit.rssi, hit.channel,
                   hit.bssid[0], hit.bssid[1], hit.bssid[2], hit.bssid[3], hit.bssid[4], hit.bssid[5]);
-    // фиксируем канал/BSSID: полезно при нескольких AP с одним SSID [page:0]
+  } else {
+    Serial.printf("[WIFI] SSID '%s' not found in scan\n", WIFI_SSID);
+  }
+
+  if (hit.found && lockToBssid) {
     WiFi.begin(WIFI_SSID, WIFI_PASS, hit.channel, hit.bssid, true);
   } else {
-    Serial.printf("[WIFI] SSID '%s' not found in scan -> begin anyway (may fail)\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
   }
 
   uint32_t t0 = ms();
   uint32_t lastPrint = 0;
 
-  while (ms() - t0 < timeoutMs) {
+  while (ms() - t0 < WIFI_TIMEOUT_MS) {
     esp_task_wdt_reset();
 
-    wl_status_t st = WiFi.status();
-    if (st == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED && g_wifi_got_ip) {
       wifiTuneAfterConnect();
       Serial.printf("[WIFI] Connected: IP=%s RSSI=%d\n",
                     WiFi.localIP().toString().c_str(), WiFi.RSSI());
@@ -305,16 +328,36 @@ static bool connectWiFiWithScan(uint32_t timeoutMs) {
 
     if (ms() - lastPrint > 500) {
       lastPrint = ms();
-      Serial.printf("[WIFI] status=%d (%s), elapsed=%u ms\n",
-                    (int)st, wlStatusStr(st), (unsigned)(ms() - t0));
+      wl_status_t st = WiFi.status();
+      Serial.printf("[WIFI] status=%d (%s), got_ip=%s, elapsed=%u ms\n",
+                    (int)st, wlStatusStr(st), g_wifi_got_ip ? "true" : "false", (unsigned)(ms() - t0));
     }
 
-    if (st == WL_CONNECT_FAILED) break;
+    // Если стек уже сообщил DISCONNECTED — выходим раньше и используем reason для диагностики
+    if (g_wifi_disconnected) {
+      Serial.printf("[WIFI] Early exit due to DISCONNECTED event: reason=%u\n", (unsigned)g_wifi_disc_reason);
+      return false;
+    }
+
     delay(50);
   }
 
   wl_status_t st = WiFi.status();
-  Serial.printf("[WIFI] FAIL: status=%d (%s)\n", (int)st, wlStatusStr(st));
+  Serial.printf("[WIFI] TIMEOUT: status=%d (%s), last_reason=%u\n", (int)st, wlStatusStr(st), (unsigned)g_wifi_disc_reason);
+  return false;
+}
+
+static bool connectWiFiRobust() {
+  wifiHardResetSTA();
+
+  // 1) попытка с фиксацией BSSID/канала
+  if (connectWiFiOnce(true)) return true;
+
+  // 2) попытка без фиксации BSSID (на случай “не нравится” forced BSSID)
+  Serial.printf("[WIFI] Retry without BSSID lock. last_reason=%u\n", (unsigned)g_wifi_disc_reason);
+  wifiHardResetSTA();
+  if (connectWiFiOnce(false)) return true;
+
   return false;
 }
 
@@ -428,7 +471,6 @@ static bool waitCmd(int cycleId, int &captureDelayMsOut) {
       captureDelayMsOut = delay_ms;
       return true;
     }
-
     delay(100);
   }
   return false;
@@ -458,8 +500,7 @@ static bool waitAck(int cycleId, bool &sleepOut) {
 }
 
 // ------------------- Resume Upload -------------------
-static bool initUpload(int cycleId, size_t jpegSize, uint32_t jpegCrc,
-                       String &transferIdOut, int &resumeFromChunk) {
+static bool initUpload(int cycleId, size_t jpegSize, uint32_t jpegCrc, String &transferIdOut, int &resumeFromChunk) {
   int chunkCount = (jpegSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
   String payload = String("{") +
@@ -494,8 +535,7 @@ static bool initUpload(int cycleId, size_t jpegSize, uint32_t jpegCrc,
   return true;
 }
 
-static bool uploadChunk(const String &transferId, int chunkIndex,
-                        const uint8_t *data, size_t len) {
+static bool uploadChunk(const String &transferId, int chunkIndex, const uint8_t *data, size_t len) {
   uint32_t chunkCrc = crc32(data, len);
 
   WiFiClient client;
@@ -542,7 +582,6 @@ static bool uploadChunk(const String &transferId, int chunkIndex,
 
   statusLine.trim();
   client.stop();
-
   return (statusLine.startsWith("HTTP/1.1 200") || statusLine.startsWith("HTTP/1.0 200"));
 }
 
@@ -566,7 +605,6 @@ static bool uploadImageResumable(camera_fb_t *fb, int cycleId) {
 
   uint32_t jpegCrc = crc32(fb->buf, fb->len);
   int chunkCount = (fb->len + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
   Serial.printf("[UPLOAD] JPEG size=%u CRC=0x%08X chunks=%d\n", fb->len, jpegCrc, chunkCount);
 
   String transferId;
@@ -620,7 +658,6 @@ static bool uploadImageResumable(camera_fb_t *fb, int cycleId) {
     }
     delay(500 * attempt);
   }
-
   return false;
 }
 
@@ -637,15 +674,17 @@ void setup() {
   esp_task_wdt_init(60, true);
   esp_task_wdt_add(NULL);
 
+  WiFi.onEvent(onWiFiEvent);
+
   blinkStatus(2, 120, 120);
   startCameraOV2640();
 
   uint32_t tBoot = ms();
 
-  // WiFi
+  // WiFi connect (robust + reason logging)
   uint32_t t0 = ms();
-  if (!connectWiFiWithScan(WIFI_TIMEOUT_MS)) {
-    Serial.println("[ERR] WiFi connect failed -> sleep");
+  if (!connectWiFiRobust()) {
+    Serial.printf("[ERR] WiFi connect failed. last_reason=%u -> sleep\n", (unsigned)g_wifi_disc_reason);
     goToSleep(FAIL_SLEEP_SEC);
   }
   Serial.printf("[TIMING] wifi_connect=%u ms rssi=%d\n", (ms() - t0), WiFi.RSSI());
@@ -684,7 +723,6 @@ void setup() {
   t0 = ms();
   camera_fb_t *fb = esp_camera_fb_get();
   uint32_t captureMs = ms() - t0;
-
   if (!fb) {
     Serial.println("[ERR] Capture FAILED -> sleep");
     goToSleep(FAIL_SLEEP_SEC);
@@ -694,7 +732,6 @@ void setup() {
   // UPLOAD
   bool uploaded = uploadImageResumable(fb, cycleId);
   esp_camera_fb_return(fb);
-
   if (!uploaded) {
     Serial.println("[ERR] Upload FAILED -> sleep");
     goToSleep(FAIL_SLEEP_SEC);
@@ -708,7 +745,6 @@ void setup() {
 
   Serial.printf("[TIMING] total_awake=%u ms\n", (ms() - tBoot));
   digitalWrite(STATUS_LED_GPIO, HIGH);
-
   goToSleep(CAPTURE_PERIOD_SEC);
 }
 
