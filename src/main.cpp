@@ -2,36 +2,68 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <time.h>
+#include <esp_task_wdt.h>
 
 // ------------------- CONFIG -------------------
 static const char* WIFI_SSID = "Raspberry";
 static const char* WIFI_PASS = "12345678";
-
 static const char* SERVER_HOST = "192.168.4.1";
 static const uint16_t SERVER_PORT = 8000;
+static const char* CAM_ID = "cam120";
 
-static const char* CAM_ID = "cam160";   // <-- THIS FILE
-static const uint32_t CAPTURE_PERIOD_SEC = 600;   // строго 10 минут
+static const uint32_t CAPTURE_PERIOD_SEC = 600;
 static const uint32_t FAIL_SLEEP_SEC = 120;
-static const uint8_t UPLOAD_RETRIES = 3;
+static const uint32_t CHUNK_SIZE = 2048;
+static const uint8_t UPLOAD_MAX_RETRIES = 3;
+static const uint8_t CHUNK_MAX_RETRIES = 5;
 
 static const uint32_t WIFI_TIMEOUT_MS = 15000;
-static const uint32_t CMD_TOTAL_WAIT_MS = 45000;
-static const uint32_t ACK_TOTAL_WAIT_MS = 45000;
+static const uint32_t CMD_TOTAL_WAIT_MS = 50000;
+static const uint32_t ACK_TOTAL_WAIT_MS = 60000;
 static const uint32_t SNTPTIMEOUT_MS = 8000;
+
+static const uint32_t HTTP_SOCK_TIMEOUT_MS = 5000;
+static const uint32_t CHUNK_SOCK_TIMEOUT_MS = 8000;
 
 static const bool WIFI_DISABLE_SLEEP = true;
 static const bool WIFI_MAX_TXPOWER = true;
 
-// ------------------- GPIO -------------------
-#define LED_FLASH_GPIO GPIO_NUM_4
-#define STATUS_LED_GPIO GPIO_NUM_33   // active LOW on many boards
+// ВАЖНО: не называем это TCP_MSS (это макрос lwIP)
+static const size_t TCP_WRITE_BLOCK = 1460;
 
-// ------------------- helpers -------------------
+#define LED_FLASH_GPIO GPIO_NUM_4
+#define STATUS_LED_GPIO GPIO_NUM_33
+
+// ------------------- CRC32 -------------------
+static uint32_t crc32_table[256];
+static bool crc32_table_computed = false;
+
+static void make_crc32_table() {
+  if (crc32_table_computed) return;
+  for (uint32_t n = 0; n < 256; n++) {
+    uint32_t c = n;
+    for (int k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xedb88320UL ^ (c >> 1)) : (c >> 1);
+    }
+    crc32_table[n] = c;
+  }
+  crc32_table_computed = true;
+}
+
+static uint32_t crc32(const uint8_t *buf, size_t len) {
+  make_crc32_table();
+  uint32_t c = 0xffffffffUL;
+  for (size_t n = 0; n < len; n++) {
+    c = crc32_table[(c ^ buf[n]) & 0xff] ^ (c >> 8);
+  }
+  return c ^ 0xffffffffUL;
+}
+
+// ------------------- Helpers -------------------
 static uint32_t ms() { return millis(); }
 
 static void goToSleep(uint32_t seconds) {
-  Serial.printf("[SLEEP] %u sec\n", (unsigned)seconds);
+  Serial.printf("[SLEEP] %u sec\n", seconds);
   esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
   esp_deep_sleep_start();
 }
@@ -68,15 +100,18 @@ struct HttpResp {
 
 static bool httpRequestRaw(const String &req, HttpResp &out, uint32_t totalTimeoutMs) {
   out = HttpResp();
+
   WiFiClient client;
-  client.setTimeout(2000);
   if (!client.connect(SERVER_HOST, SERVER_PORT)) return false;
 
-  client.print(req);
+  // ВАЖНО: setTimeout только после connect (иначе EBADF-spam на некоторых ядрах)
+  client.setTimeout(HTTP_SOCK_TIMEOUT_MS);
 
+  client.print(req);
   uint32_t t0 = ms();
+
   String statusLine;
-  if (!readLine(client, statusLine, 2000)) { client.stop(); return false; }
+  if (!readLine(client, statusLine, 3000)) { client.stop(); return false; }
 
   int sp = statusLine.indexOf(' ');
   if (sp < 0) { client.stop(); return false; }
@@ -87,7 +122,7 @@ static bool httpRequestRaw(const String &req, HttpResp &out, uint32_t totalTimeo
   int contentLen = -1;
   while (true) {
     String h;
-    if (!readLine(client, h, 2000)) { client.stop(); return false; }
+    if (!readLine(client, h, 3000)) { client.stop(); return false; }
     if (h.length() == 0) break;
     String hl = h; hl.toLowerCase();
     if (hl.startsWith("content-length:")) contentLen = hl.substring(15).toInt();
@@ -99,7 +134,8 @@ static bool httpRequestRaw(const String &req, HttpResp &out, uint32_t totalTimeo
 
   if (contentLen >= 0) {
     while ((int)body.length() < contentLen && (ms() - t0 < totalTimeoutMs)) {
-      while (client.available() && (int)body.length() < contentLen) body += (char)client.read();
+      while (client.available() && (int)body.length() < contentLen)
+        body += (char)client.read();
       if (!client.connected() && !client.available()) break;
       delay(1);
     }
@@ -124,11 +160,23 @@ static bool jsonFindInt(const String &json, const char *key, int &out) {
   int colon = json.indexOf(':', idx);
   if (colon < 0) return false;
   colon++;
-  while (colon < (int)json.length() && (json[colon] == ' ' || json[colon] == '\"')) colon++;
+  while (colon < (int)json.length() && (json[colon] == ' ' || json[colon] == '"')) colon++;
   String num = "";
-  while (colon < (int)json.length() && isdigit((unsigned char)json[colon])) num += json[colon++];
+  while (colon < (int)json.length() && (isdigit(json[colon]) || json[colon] == '-'))
+    num += json[colon++];
   if (num.length() == 0) return false;
   out = num.toInt();
+  return true;
+}
+
+static bool jsonFindString(const String &json, const char *key, String &out) {
+  String pat = String("\"") + key + "\":\"";
+  int idx = json.indexOf(pat);
+  if (idx < 0) return false;
+  idx += pat.length();
+  int end = json.indexOf('"', idx);
+  if (end < 0) return false;
+  out = json.substring(idx, end);
   return true;
 }
 
@@ -139,7 +187,7 @@ static bool jsonFindBool(const String &json, const char *key, bool &out) {
   int colon = json.indexOf(':', idx);
   if (colon < 0) return false;
   colon++;
-  while (colon < (int)json.length() && (json[colon] == ' ')) colon++;
+  while (colon < (int)json.length() && json[colon] == ' ') colon++;
   if (json.substring(colon).startsWith("true")) { out = true; return true; }
   if (json.substring(colon).startsWith("false")) { out = false; return true; }
   return false;
@@ -154,7 +202,10 @@ static bool connectWiFi(uint32_t timeoutMs) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0 = ms();
-  while (WiFi.status() != WL_CONNECTED && (ms() - t0 < timeoutMs)) delay(50);
+  while (WiFi.status() != WL_CONNECTED && (ms() - t0 < timeoutMs)) {
+    delay(50);
+    esp_task_wdt_reset();
+  }
   if (WiFi.status() != WL_CONNECTED) return false;
   wifiTuneAfterConnect();
   return true;
@@ -165,13 +216,14 @@ static bool syncTimeSNTP() {
   uint32_t t0 = ms();
   struct tm ti;
   while (ms() - t0 < SNTPTIMEOUT_MS) {
+    esp_task_wdt_reset();
     if (getLocalTime(&ti, 200)) return true;
     delay(50);
   }
   return false;
 }
 
-// ------------------- Camera init OV2640 (AI Thinker) -------------------
+// ------------------- Camera Init -------------------
 static void startCameraOV2640() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -193,36 +245,41 @@ static void startCameraOV2640() {
   config.pin_pwdn = 32;
   config.pin_reset = -1;
 
-  config.xclk_freq_hz = 20000000;              // если будут сбои -> 10MHz
+  config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
   if (!psramFound()) {
-    // без PSRAM лучше не продолжать
+    Serial.println("[ERR] PSRAM NOT FOUND - HALTING");
     while (true) delay(1000);
   }
 
-  // Для алгоритмов (текстура облака) важно разрешение; но для стабильности и трафика лучше начать с VGA.
-  config.frame_size = FRAMESIZE_VGA;           // 640x480
-  config.jpeg_quality = 12;                    // компромисс
-  config.fb_count = 2;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.frame_size = FRAMESIZE_UXGA;
+  config.jpeg_quality = 10;
+  config.fb_count = 1;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) while (true) delay(1000);
+  if (err != ESP_OK) {
+    Serial.printf("[ERR] Camera init failed: 0x%x\n", err);
+    while (true) delay(1000);
+  }
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
     s->set_whitebal(s, 1);
     s->set_gain_ctrl(s, 1);
     s->set_exposure_ctrl(s, 1);
-    s->set_aec2(s, 0);
     s->set_lenc(s, 1);
+    s->set_raw_gma(s, 1);
+    s->set_gainceiling(s, (gainceiling_t)2);
   }
+  Serial.println("[OK] OV2640 UXGA initialized");
 }
 
-// ------------------- API calls -------------------
-static bool postHello(int &cycleIdOut, int &serverMsOut) {
-  String payload = String("{\"deviceid\":\"") + CAM_ID + "\"}";
+// ------------------- API Calls -------------------
+static bool postHello(int &cycleIdOut, int &delayMsOut) {
+  String payload = String("{\"deviceid\":\"") + CAM_ID + "\",\"local_ms\":" + String(ms()) + "}";
   String req =
       String("POST /hello HTTP/1.1\r\n") +
       "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" +
@@ -232,34 +289,35 @@ static bool postHello(int &cycleIdOut, int &serverMsOut) {
       payload;
 
   HttpResp r;
-  if (!httpRequestRaw(req, r, 5000)) return false;
+  if (!httpRequestRaw(req, r, 7000)) return false;
   if (r.status != 200) return false;
-  int cid = -1, sm = -1;
+
+  int cid = -1, delay_ms = -1;
   if (!jsonFindInt(r.body, "cycle_id", cid)) return false;
-  if (!jsonFindInt(r.body, "server_ms", sm)) return false;
+  if (!jsonFindInt(r.body, "capture_delay_ms", delay_ms)) return false;
   cycleIdOut = cid;
-  serverMsOut = sm;
+  delayMsOut = delay_ms;
   return true;
 }
 
-static bool waitCmd(int cycleId, int &tCaptureMsOut, int &serverMsOut) {
+static bool waitCmd(int cycleId, int &captureMsOut) {
   uint32_t t0 = ms();
   while (ms() - t0 < CMD_TOTAL_WAIT_MS) {
-    String path = String("/waitcmd?deviceid=") + CAM_ID + "&cycle_id=" + String(cycleId);
+    esp_task_wdt_reset();
+    String path = String("/waitcmd?deviceid=") + CAM_ID + "&cycle_id=" + String(cycleId) + "&local_ms=" + String(ms());
     String req =
         String("GET ") + path + " HTTP/1.1\r\n" +
-        "Host: " + String(SERVER_HOST) + ":" + String(SERVER_PORT) + "\r\n" +
+        "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" +
         "Connection: close\r\n\r\n";
+
     HttpResp r;
-    if (!httpRequestRaw(req, r, 32000)) { delay(50); continue; }
-    if (r.status != 200) { delay(50); continue; }
+    if (!httpRequestRaw(req, r, 35000)) { delay(100); continue; }
+    if (r.status != 200) { delay(100); continue; }
 
     if (r.body.indexOf("\"type\":\"CAPTURE_AT\"") >= 0) {
-      int tcap = -1, sm = -1;
-      if (!jsonFindInt(r.body, "t_capture_ms", tcap)) return false;
-      if (!jsonFindInt(r.body, "server_ms", sm)) return false;
-      tCaptureMsOut = tcap;
-      serverMsOut = sm;
+      int delay_ms = -1;
+      if (!jsonFindInt(r.body, "capture_delay_ms", delay_ms)) return false;
+      captureMsOut = delay_ms;
       return true;
     }
     delay(100);
@@ -270,77 +328,190 @@ static bool waitCmd(int cycleId, int &tCaptureMsOut, int &serverMsOut) {
 static bool waitAck(int cycleId, bool &sleepOut) {
   uint32_t t0 = ms();
   while (ms() - t0 < ACK_TOTAL_WAIT_MS) {
+    esp_task_wdt_reset();
     String path = String("/waitack?deviceid=") + CAM_ID + "&cycle_id=" + String(cycleId);
     String req =
         String("GET ") + path + " HTTP/1.1\r\n" +
-        "Host: " + String(SERVER_HOST) + ":" + String(SERVER_PORT) + "\r\n" +
+        "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" +
         "Connection: close\r\n\r\n";
+
     HttpResp r;
-    if (!httpRequestRaw(req, r, 32000)) { delay(50); continue; }
-    if (r.status != 200) { delay(50); continue; }
+    if (!httpRequestRaw(req, r, 35000)) { delay(100); continue; }
+    if (r.status != 200) { delay(100); continue; }
+
     bool s = false;
-    if (!jsonFindBool(r.body, "sleep", s)) { delay(50); continue; }
+    if (!jsonFindBool(r.body, "sleep", s)) { delay(100); continue; }
     sleepOut = s;
     return true;
   }
   return false;
 }
 
-static bool postMultipartJpeg(camera_fb_t *fb, int cycleId,
-                             const String &metaJson) {
-  if (!fb || !fb->buf || fb->len == 0) return false;
+// ------------------- Resume Upload -------------------
+static bool initUpload(int cycleId, size_t jpegSize, uint32_t jpegCrc, String &transferIdOut, int &resumeFromChunk) {
+  int chunkCount = (jpegSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+  String payload = String("{") +
+    "\"cam_id\":\"" + CAM_ID + "\"," +
+    "\"cycle_id\":" + String(cycleId) + "," +
+    "\"jpeg_size\":" + String(jpegSize) + "," +
+    "\"chunk_size\":" + String(CHUNK_SIZE) + "," +
+    "\"chunk_count\":" + String(chunkCount) + "," +
+    "\"jpeg_crc32\":\"" + String(jpegCrc, HEX) + "\"," +
+    "\"rssi\":" + String(WiFi.RSSI()) +
+    "}";
+
+  String req =
+      String("POST /upload/init HTTP/1.1\r\n") +
+      "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" +
+      "Connection: close\r\n" +
+      "Content-Type: application/json\r\n" +
+      "Content-Length: " + String(payload.length()) + "\r\n\r\n" +
+      payload;
+
+  HttpResp r;
+  if (!httpRequestRaw(req, r, 12000)) return false;
+  if (r.status != 200) return false;
+
+  String tid;
+  int resume = 0;
+  if (!jsonFindString(r.body, "transfer_id", tid)) return false;
+  jsonFindInt(r.body, "resume_from_chunk", resume);
+
+  transferIdOut = tid;
+  resumeFromChunk = resume;
+  return true;
+}
+
+static bool uploadChunk(const String &transferId, int chunkIndex, const uint8_t *data, size_t len) {
+  uint32_t chunkCrc = crc32(data, len);
 
   WiFiClient client;
-  client.setTimeout(2000);
   if (!client.connect(SERVER_HOST, SERVER_PORT)) return false;
 
-  const String boundary = "----esp32Boundary7MA4YWxk";
-  const String path = String("/upload?camid=") + CAM_ID + "&cycle_id=" + String(cycleId);
+  client.setTimeout(CHUNK_SOCK_TIMEOUT_MS);
+  client.setNoDelay(true);
 
-  const String partMeta =
-      String("--") + boundary + "\r\n" +
-      "Content-Disposition: form-data; name=\"meta\"\r\n" +
-      "Content-Type: application/json\r\n\r\n" +
-      metaJson + "\r\n";
+  String headers =
+      String("POST /upload/chunk HTTP/1.1\r\n") +
+      "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" +
+      "Connection: close\r\n" +
+      "X-Transfer-ID: " + transferId + "\r\n" +
+      "X-Chunk-Index: " + String(chunkIndex) + "\r\n" +
+      "X-Chunk-CRC32: " + String(chunkCrc, HEX) + "\r\n" +
+      "Content-Type: application/octet-stream\r\n" +
+      "Content-Length: " + String(len) + "\r\n\r\n";
 
-  const String partFileHead =
-      String("--") + boundary + "\r\n" +
-      "Content-Disposition: form-data; name=\"file\"; filename=\"frame.jpg\"\r\n" +
-      "Content-Type: image/jpeg\r\n\r\n";
+  client.print(headers);
 
-  const String tail = String("\r\n--") + boundary + "--\r\n";
+  size_t written = 0;
+  size_t remaining = len;
+  const uint8_t *ptr = data;
 
-  uint32_t contentLength = partMeta.length() + partFileHead.length() + fb->len + tail.length();
-
-  client.print(String("POST ") + path + " HTTP/1.1\r\n");
-  client.print(String("Host: ") + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n");
-  client.print("Connection: close\r\n");
-  client.print(String("Content-Type: multipart/form-data; boundary=") + boundary + "\r\n");
-  client.print(String("Content-Length: ") + String(contentLength) + "\r\n\r\n");
-
-  client.print(partMeta);
-  client.print(partFileHead);
-
-  const uint8_t *p = fb->buf;
-  size_t remaining = fb->len;
   while (remaining > 0) {
-    size_t chunk = remaining > 1024 ? 1024 : remaining;
-    size_t written = client.write(p, chunk);
-    if (written == 0) { client.stop(); return false; }
-    p += written;
-    remaining -= written;
-    delay(1);
+    size_t blk = (remaining > TCP_WRITE_BLOCK) ? TCP_WRITE_BLOCK : remaining;
+    size_t w = client.write(ptr, blk);
+    if (w == 0) break;
+    written += w;
+    ptr += w;
+    remaining -= w;
   }
 
-  client.print(tail);
+  if (written != len) {
+    client.stop();
+    return false;
+  }
 
   String statusLine;
-  if (!readLine(client, statusLine, 2000)) { client.stop(); return false; }
+  if (!readLine(client, statusLine, 5000)) {
+    client.stop();
+    return false;
+  }
+
   statusLine.trim();
   client.stop();
+
   return (statusLine.startsWith("HTTP/1.1 200") || statusLine.startsWith("HTTP/1.0 200"));
 }
 
+static bool finalizeUpload(const String &transferId) {
+  String payload = String("{\"transfer_id\":\"") + transferId + "\"}";
+  String req =
+      String("POST /upload/finalize HTTP/1.1\r\n") +
+      "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" +
+      "Connection: close\r\n" +
+      "Content-Type: application/json\r\n" +
+      "Content-Length: " + String(payload.length()) + "\r\n\r\n" +
+      payload;
+
+  HttpResp r;
+  if (!httpRequestRaw(req, r, 12000)) return false;
+  return (r.status == 200);
+}
+
+static bool uploadImageResumable(camera_fb_t *fb, int cycleId) {
+  if (!fb || !fb->buf || fb->len == 0) return false;
+
+  uint32_t jpegCrc = crc32(fb->buf, fb->len);
+  int chunkCount = (fb->len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+  Serial.printf("[UPLOAD] JPEG size=%u CRC=0x%08X chunks=%d\n", fb->len, jpegCrc, chunkCount);
+
+  String transferId;
+  int resumeFromChunk = 0;
+
+  for (uint8_t attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
+    if (initUpload(cycleId, fb->len, jpegCrc, transferId, resumeFromChunk)) {
+      Serial.printf("[UPLOAD] Init OK: transfer_id=%s resume_from=%d\n", transferId.c_str(), resumeFromChunk);
+      break;
+    }
+    if (attempt == UPLOAD_MAX_RETRIES) return false;
+    delay(500 * attempt);
+  }
+
+  uint32_t uploadStart = ms();
+  for (int i = resumeFromChunk; i < chunkCount; i++) {
+    esp_task_wdt_reset();
+
+    size_t offset = (size_t)i * CHUNK_SIZE;
+    size_t chunkLen = (offset + CHUNK_SIZE <= fb->len) ? CHUNK_SIZE : (fb->len - offset);
+
+    bool chunkOk = false;
+    for (uint8_t retry = 1; retry <= CHUNK_MAX_RETRIES; retry++) {
+      if (uploadChunk(transferId, i, &fb->buf[offset], chunkLen)) {
+        chunkOk = true;
+        break;
+      }
+      Serial.printf("[WARN] Chunk %d retry %d\n", i, retry);
+      delay(100 * retry);
+    }
+
+    if (!chunkOk) {
+      Serial.printf("[ERR] Chunk %d failed after %d retries\n", i, CHUNK_MAX_RETRIES);
+      return false;
+    }
+
+    if ((i % 10) == 0 || i == chunkCount - 1) {
+      Serial.printf("[PROGRESS] %d/%d chunks (%.1f%%)\n", i + 1, chunkCount, ((i + 1) * 100.0) / chunkCount);
+    }
+  }
+
+  uint32_t uploadMs = ms() - uploadStart;
+  float rate = (fb->len * 1000.0f) / (uploadMs * 1024.0f);
+  Serial.printf("[UPLOAD] Complete in %u ms (%.1f KB/s)\n", uploadMs, rate);
+
+  for (uint8_t attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
+    if (finalizeUpload(transferId)) {
+      Serial.println("[UPLOAD] Finalized OK");
+      return true;
+    }
+    delay(500 * attempt);
+  }
+
+  return false;
+}
+
+// ------------------- Main -------------------
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -350,6 +521,9 @@ void setup() {
   pinMode(STATUS_LED_GPIO, OUTPUT);
   digitalWrite(STATUS_LED_GPIO, HIGH);
 
+  esp_task_wdt_init(60, true);
+  esp_task_wdt_add(NULL);
+
   blinkStatus(2, 120, 120);
   startCameraOV2640();
 
@@ -357,79 +531,54 @@ void setup() {
 
   uint32_t t0 = ms();
   if (!connectWiFi(WIFI_TIMEOUT_MS)) goToSleep(FAIL_SLEEP_SEC);
-  Serial.printf("[TIMING] wifi_connect_ms=%u rssi=%d\n", (unsigned)(ms() - t0), WiFi.RSSI());
+  Serial.printf("[TIMING] wifi_connect=%u ms rssi=%d\n", (ms() - t0), WiFi.RSSI());
 
   t0 = ms();
   bool timeOk = syncTimeSNTP();
-  Serial.printf("[TIMING] sntp_ms=%u ok=%s\n", (unsigned)(ms() - t0), timeOk ? "true" : "false");
+  Serial.printf("[TIMING] sntp=%u ms ok=%s\n", (ms() - t0), timeOk ? "true" : "false");
 
-  int cycleId = -1, helloServerMs = -1;
+  int cycleId = -1, captureDelayMs = -1;
   t0 = ms();
-  bool helloOk = postHello(cycleId, helloServerMs);
-  Serial.printf("[TIMING] hello_ms=%u ok=%s cycle_id=%d\n",
-                (unsigned)(ms() - t0), helloOk ? "true" : "false", cycleId);
-  if (!helloOk) goToSleep(FAIL_SLEEP_SEC);
+  if (!postHello(cycleId, captureDelayMs)) goToSleep(FAIL_SLEEP_SEC);
+  Serial.printf("[TIMING] hello=%u ms cycle_id=%d capture_delay=%d\n", (ms() - t0), cycleId, captureDelayMs);
 
-  int tCaptureMs = -1, cmdServerMs = -1;
+  int cmdCaptureDelayMs = -1;
   t0 = ms();
-  bool cmdOk = waitCmd(cycleId, tCaptureMs, cmdServerMs);
-  Serial.printf("[TIMING] waitcmd_ms=%u ok=%s t_capture_ms=%d\n",
-                (unsigned)(ms() - t0), cmdOk ? "true" : "false", tCaptureMs);
-  if (!cmdOk) goToSleep(FAIL_SLEEP_SEC);
+  if (!waitCmd(cycleId, cmdCaptureDelayMs)) goToSleep(FAIL_SLEEP_SEC);
+  Serial.printf("[TIMING] waitcmd=%u ms capture_delay=%d\n", (ms() - t0), cmdCaptureDelayMs);
 
-  // Выравнивание CAPTURE_AT: оценим смещение local_ms - server_ms
-  int offsetMs = (int)ms() - cmdServerMs;
-  int waitMs = tCaptureMs + offsetMs - (int)ms();
-  if (waitMs > 0) delay((uint32_t)waitMs);
+  // Синхронная съёмка (не трогаем задумку)
+  int waitMs = cmdCaptureDelayMs;
+  if (waitMs > 0 && waitMs < 10000) {
+    Serial.printf("[SYNC] Waiting %d ms for synchronized capture\n", waitMs);
+    delay((uint32_t)waitMs);
+  }
 
-  // CAPTURE
   t0 = ms();
   camera_fb_t *fb = esp_camera_fb_get();
   uint32_t captureMs = ms() - t0;
+
   if (!fb) {
     Serial.println("[ERR] Capture FAILED");
     goToSleep(FAIL_SLEEP_SEC);
   }
-  Serial.printf("[TIMING] capture_ms=%u jpeg_bytes=%u\n", (unsigned)captureMs, (unsigned)fb->len);
+  Serial.printf("[TIMING] capture=%u ms jpeg_bytes=%u\n", captureMs, fb->len);
 
-  // META JSON
-  String meta = "{";
-  meta += "\"cam_id\":\"" + String(CAM_ID) + "\",";
-  meta += "\"cycle_id\":" + String(cycleId) + ",";
-  meta += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  meta += "\"local_ms\":" + String((int)ms()) + ",";
-  meta += "\"cmd_server_ms\":" + String(cmdServerMs) + ",";
-  meta += "\"t_capture_ms\":" + String(tCaptureMs) + ",";
-  meta += "\"capture_ms\":" + String((unsigned)captureMs) + ",";
-  meta += "\"jpeg_bytes\":" + String((unsigned)fb->len) + ",";
-  meta += "\"time_valid\":" + String(timeOk ? "true" : "false");
-  meta += "}";
-
-  // UPLOAD
-  bool uploaded = false;
-  uint32_t uploadStart = ms();
-  for (uint8_t attempt = 1; attempt <= UPLOAD_RETRIES; attempt++) {
-    uint32_t ta = ms();
-    bool ok = postMultipartJpeg(fb, cycleId, meta);
-    uint32_t dt = ms() - ta;
-    Serial.printf("[TIMING] upload_try=%u dt_ms=%u ok=%s\n",
-                  attempt, (unsigned)dt, ok ? "true" : "false");
-    if (ok) { uploaded = true; break; }
-    delay(200 * attempt);
-  }
+  bool uploaded = uploadImageResumable(fb, cycleId);
   esp_camera_fb_return(fb);
-  Serial.printf("[TIMING] upload_total_ms=%u uploaded=%s\n",
-                (unsigned)(ms() - uploadStart), uploaded ? "true" : "false");
-  if (!uploaded) goToSleep(FAIL_SLEEP_SEC);
 
-  // ACK
+  if (!uploaded) {
+    Serial.println("[ERR] Upload FAILED");
+    goToSleep(FAIL_SLEEP_SEC);
+  }
+
   bool sleepFlag = false;
   t0 = ms();
-  bool ackOk = waitAck(cycleId, sleepFlag);
-  Serial.printf("[TIMING] waitack_ms=%u ok=%s sleep=%s\n",
-                (unsigned)(ms() - t0), ackOk ? "true" : "false", sleepFlag ? "true" : "false");
+  waitAck(cycleId, sleepFlag);
+  Serial.printf("[TIMING] waitack=%u ms sleep=%s\n", (ms() - t0), sleepFlag ? "true" : "false");
 
-  Serial.printf("[TIMING] total_awake_ms=%u\n", (unsigned)(ms() - tBoot));
+  Serial.printf("[TIMING] total_awake=%u ms\n", (ms() - tBoot));
+  digitalWrite(STATUS_LED_GPIO, HIGH);
   goToSleep(CAPTURE_PERIOD_SEC);
 }
 
