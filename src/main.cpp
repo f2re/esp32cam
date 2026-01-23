@@ -10,12 +10,15 @@ static const char* WIFI_PASS = "12345678";
 static const char* SERVER_HOST = "192.168.4.1";
 static const uint16_t SERVER_PORT = 8000;
 
-static const char* CAM_ID = "cam160";   // Для второй камеры сделайте отдельную сборку с "cam120"
+static const char* CAM_ID = "cam160";   // для второй камеры соберите отдельный бинарник с "cam120"
 
 static const uint32_t CAPTURE_PERIOD_SEC = 600;
 static const uint32_t FAIL_SLEEP_SEC = 120;
 
-static const uint32_t WIFI_TIMEOUT_MS = 30000;   // Увеличено: даём Wi-Fi реально подняться
+static const uint32_t WIFI_TIMEOUT_MS = 30000;
+static const uint32_t WIFI_SCAN_TIMEOUT_MS = 8000;
+static const uint8_t  WIFI_SCAN_ATTEMPTS = 2;
+
 static const uint32_t CMD_TOTAL_WAIT_MS = 50000;
 static const uint32_t ACK_TOTAL_WAIT_MS = 60000;
 static const uint32_t SNTPTIMEOUT_MS = 8000;
@@ -30,7 +33,7 @@ static const uint32_t CHUNK_SIZE = 2048;
 static const uint8_t  UPLOAD_MAX_RETRIES = 3;
 static const uint8_t  CHUNK_MAX_RETRIES  = 5;
 
-// Не называем TCP_MSS (это макрос lwIP)
+// не называем TCP_MSS (это макрос lwIP)
 static const size_t TCP_WRITE_BLOCK = 1460;
 
 #define LED_FLASH_GPIO   GPIO_NUM_4
@@ -206,21 +209,85 @@ static void wifiTuneAfterConnect() {
   if (WIFI_MAX_TXPOWER) WiFi.setTxPower(WIFI_POWER_19_5dBm);
 }
 
-static bool connectWiFiDetailed(uint32_t timeoutMs) {
+static void printScanResult(int n) {
+  Serial.printf("[WIFI] Scan done: %d networks\n", n);
+  for (int i = 0; i < n; i++) {
+    Serial.printf("[WIFI]  %2d) SSID='%s' RSSI=%d ch=%d enc=%d\n",
+                  i + 1,
+                  WiFi.SSID(i).c_str(),
+                  WiFi.RSSI(i),
+                  WiFi.channel(i),
+                  (int)WiFi.encryptionType(i));
+    delay(2);
+  }
+}
+
+struct SsidHit {
+  bool found = false;
+  int channel = 0;
+  int rssi = -999;
+  uint8_t bssid[6] = {0};
+};
+
+static SsidHit findBestAPForSSID(const char* targetSsid) {
+  SsidHit best;
+  uint32_t t0 = ms();
+
+  // активный scan, чтобы подтвердить WL_NO_SSID_AVAIL фактом видимости [page:0]
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+  (void)t0;
+  printScanResult(n);
+
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == String(targetSsid)) {
+      int rssi = WiFi.RSSI(i);
+      if (!best.found || rssi > best.rssi) {
+        best.found = true;
+        best.rssi = rssi;
+        best.channel = WiFi.channel(i);
+        const uint8_t* b = WiFi.BSSID(i);
+        if (b) memcpy(best.bssid, b, 6);
+      }
+    }
+  }
+  return best;
+}
+
+static bool connectWiFiWithScan(uint32_t timeoutMs) {
   Serial.printf("[WIFI] Connecting to SSID='%s'\n", WIFI_SSID);
 
-  // “Жёсткий” сброс Wi‑Fi, чтобы исключить зависшие состояния (особенно после deep sleep/неудачных коннектов). [web:114]
+  // защититься от перезаписи flash при частых deep sleep [page:0]
   WiFi.persistent(false);
+
+  // “жёсткий” сброс Wi-Fi стека
   WiFi.disconnect(true);
   delay(200);
   WiFi.mode(WIFI_OFF);
   delay(200);
   WiFi.mode(WIFI_STA);
 
-  WiFi.setAutoReconnect(true);  // полезно при нестабильной точке/шуме [web:111]
+  WiFi.setAutoReconnect(true);
   if (WIFI_DISABLE_SLEEP) WiFi.setSleep(false);
 
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // несколько попыток scan: если SSID не находится, сразу видно, что это RF/инфраструктура, а не HTTP/сервер
+  SsidHit hit;
+  for (uint8_t a = 1; a <= WIFI_SCAN_ATTEMPTS; a++) {
+    Serial.printf("[WIFI] Scan attempt %u/%u ...\n", a, WIFI_SCAN_ATTEMPTS);
+    hit = findBestAPForSSID(WIFI_SSID);
+    if (hit.found) break;
+    delay(300);
+  }
+
+  if (hit.found) {
+    Serial.printf("[WIFI] Found SSID='%s': best RSSI=%d ch=%d BSSID=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                  WIFI_SSID, hit.rssi, hit.channel,
+                  hit.bssid[0], hit.bssid[1], hit.bssid[2], hit.bssid[3], hit.bssid[4], hit.bssid[5]);
+    // фиксируем канал/BSSID: полезно при нескольких AP с одним SSID [page:0]
+    WiFi.begin(WIFI_SSID, WIFI_PASS, hit.channel, hit.bssid, true);
+  } else {
+    Serial.printf("[WIFI] SSID '%s' not found in scan -> begin anyway (may fail)\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
 
   uint32_t t0 = ms();
   uint32_t lastPrint = 0;
@@ -236,16 +303,13 @@ static bool connectWiFiDetailed(uint32_t timeoutMs) {
       return true;
     }
 
-    // Диагностика статуса подключения (чтобы видеть, WL_NO_SSID_AVAIL/CONNECT_FAILED/…)
     if (ms() - lastPrint > 500) {
       lastPrint = ms();
       Serial.printf("[WIFI] status=%d (%s), elapsed=%u ms\n",
                     (int)st, wlStatusStr(st), (unsigned)(ms() - t0));
     }
 
-    // Если аутентификация/подключение явно “сломалось”, выходим раньше таймаута
     if (st == WL_CONNECT_FAILED) break;
-
     delay(50);
   }
 
@@ -580,13 +644,13 @@ void setup() {
 
   // WiFi
   uint32_t t0 = ms();
-  if (!connectWiFiDetailed(WIFI_TIMEOUT_MS)) {
+  if (!connectWiFiWithScan(WIFI_TIMEOUT_MS)) {
     Serial.println("[ERR] WiFi connect failed -> sleep");
     goToSleep(FAIL_SLEEP_SEC);
   }
   Serial.printf("[TIMING] wifi_connect=%u ms rssi=%d\n", (ms() - t0), WiFi.RSSI());
 
-  // SNTP (не критично для синхронной съёмки по delay, но полезно для логов/метаданных)
+  // SNTP
   t0 = ms();
   bool timeOk = syncTimeSNTP();
   Serial.printf("[TIMING] sntp=%u ms ok=%s\n", (ms() - t0), timeOk ? "true" : "false");
@@ -609,7 +673,7 @@ void setup() {
   }
   Serial.printf("[TIMING] waitcmd=%u ms capture_delay=%d\n", (ms() - t0), cmdCaptureDelayMs);
 
-  // --- СИНХРОННАЯ СЪЁМКА (не меняем принцип) ---
+  // --- СИНХРОННАЯ СЪЁМКА (принцип сохранён) ---
   int waitMs = cmdCaptureDelayMs;
   if (waitMs > 0 && waitMs < 10000) {
     Serial.printf("[SYNC] Waiting %d ms for synchronized capture\n", waitMs);
