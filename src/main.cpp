@@ -9,30 +9,32 @@ static const char* WIFI_SSID = "Raspberry";
 static const char* WIFI_PASS = "12345678";
 static const char* SERVER_HOST = "192.168.4.1";
 static const uint16_t SERVER_PORT = 8000;
-static const char* CAM_ID = "cam120";
+
+static const char* CAM_ID = "cam160";   // Для второй камеры сделайте отдельную сборку с "cam120"
 
 static const uint32_t CAPTURE_PERIOD_SEC = 600;
 static const uint32_t FAIL_SLEEP_SEC = 120;
-static const uint32_t CHUNK_SIZE = 2048;
-static const uint8_t UPLOAD_MAX_RETRIES = 3;
-static const uint8_t CHUNK_MAX_RETRIES = 5;
 
-static const uint32_t WIFI_TIMEOUT_MS = 15000;
+static const uint32_t WIFI_TIMEOUT_MS = 30000;   // Увеличено: даём Wi-Fi реально подняться
 static const uint32_t CMD_TOTAL_WAIT_MS = 50000;
 static const uint32_t ACK_TOTAL_WAIT_MS = 60000;
 static const uint32_t SNTPTIMEOUT_MS = 8000;
 
-static const uint32_t HTTP_SOCK_TIMEOUT_MS = 5000;
+static const uint32_t HTTP_SOCK_TIMEOUT_MS  = 5000;
 static const uint32_t CHUNK_SOCK_TIMEOUT_MS = 8000;
 
 static const bool WIFI_DISABLE_SLEEP = true;
-static const bool WIFI_MAX_TXPOWER = true;
+static const bool WIFI_MAX_TXPOWER   = true;
 
-// ВАЖНО: не называем это TCP_MSS (это макрос lwIP)
+static const uint32_t CHUNK_SIZE = 2048;
+static const uint8_t  UPLOAD_MAX_RETRIES = 3;
+static const uint8_t  CHUNK_MAX_RETRIES  = 5;
+
+// Не называем TCP_MSS (это макрос lwIP)
 static const size_t TCP_WRITE_BLOCK = 1460;
 
-#define LED_FLASH_GPIO GPIO_NUM_4
-#define STATUS_LED_GPIO GPIO_NUM_33
+#define LED_FLASH_GPIO   GPIO_NUM_4
+#define STATUS_LED_GPIO  GPIO_NUM_33
 
 // ------------------- CRC32 -------------------
 static uint32_t crc32_table[256];
@@ -42,9 +44,7 @@ static void make_crc32_table() {
   if (crc32_table_computed) return;
   for (uint32_t n = 0; n < 256; n++) {
     uint32_t c = n;
-    for (int k = 0; k < 8; k++) {
-      c = (c & 1) ? (0xedb88320UL ^ (c >> 1)) : (c >> 1);
-    }
+    for (int k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320UL ^ (c >> 1)) : (c >> 1);
     crc32_table[n] = c;
   }
   crc32_table_computed = true;
@@ -53,17 +53,29 @@ static void make_crc32_table() {
 static uint32_t crc32(const uint8_t *buf, size_t len) {
   make_crc32_table();
   uint32_t c = 0xffffffffUL;
-  for (size_t n = 0; n < len; n++) {
-    c = crc32_table[(c ^ buf[n]) & 0xff] ^ (c >> 8);
-  }
+  for (size_t n = 0; n < len; n++) c = crc32_table[(c ^ buf[n]) & 0xff] ^ (c >> 8);
   return c ^ 0xffffffffUL;
 }
 
 // ------------------- Helpers -------------------
 static uint32_t ms() { return millis(); }
 
+static const char* wlStatusStr(wl_status_t st) {
+  switch (st) {
+    case WL_IDLE_STATUS:      return "WL_IDLE_STATUS";
+    case WL_NO_SSID_AVAIL:    return "WL_NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED:   return "WL_SCAN_COMPLETED";
+    case WL_CONNECTED:        return "WL_CONNECTED";
+    case WL_CONNECT_FAILED:   return "WL_CONNECT_FAILED";
+    case WL_CONNECTION_LOST:  return "WL_CONNECTION_LOST";
+    case WL_DISCONNECTED:     return "WL_DISCONNECTED";
+    default:                  return "WL_UNKNOWN";
+  }
+}
+
 static void goToSleep(uint32_t seconds) {
   Serial.printf("[SLEEP] %u sec\n", seconds);
+  Serial.flush();
   esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
   esp_deep_sleep_start();
 }
@@ -100,11 +112,9 @@ struct HttpResp {
 
 static bool httpRequestRaw(const String &req, HttpResp &out, uint32_t totalTimeoutMs) {
   out = HttpResp();
-
   WiFiClient client;
-  if (!client.connect(SERVER_HOST, SERVER_PORT)) return false;
 
-  // ВАЖНО: setTimeout только после connect (иначе EBADF-spam на некоторых ядрах)
+  if (!client.connect(SERVER_HOST, SERVER_PORT)) return false;
   client.setTimeout(HTTP_SOCK_TIMEOUT_MS);
 
   client.print(req);
@@ -134,8 +144,7 @@ static bool httpRequestRaw(const String &req, HttpResp &out, uint32_t totalTimeo
 
   if (contentLen >= 0) {
     while ((int)body.length() < contentLen && (ms() - t0 < totalTimeoutMs)) {
-      while (client.available() && (int)body.length() < contentLen)
-        body += (char)client.read();
+      while (client.available() && (int)body.length() < contentLen) body += (char)client.read();
       if (!client.connected() && !client.available()) break;
       delay(1);
     }
@@ -162,8 +171,7 @@ static bool jsonFindInt(const String &json, const char *key, int &out) {
   colon++;
   while (colon < (int)json.length() && (json[colon] == ' ' || json[colon] == '"')) colon++;
   String num = "";
-  while (colon < (int)json.length() && (isdigit(json[colon]) || json[colon] == '-'))
-    num += json[colon++];
+  while (colon < (int)json.length() && (isdigit(json[colon]) || json[colon] == '-')) num += json[colon++];
   if (num.length() == 0) return false;
   out = num.toInt();
   return true;
@@ -198,17 +206,52 @@ static void wifiTuneAfterConnect() {
   if (WIFI_MAX_TXPOWER) WiFi.setTxPower(WIFI_POWER_19_5dBm);
 }
 
-static bool connectWiFi(uint32_t timeoutMs) {
+static bool connectWiFiDetailed(uint32_t timeoutMs) {
+  Serial.printf("[WIFI] Connecting to SSID='%s'\n", WIFI_SSID);
+
+  // “Жёсткий” сброс Wi‑Fi, чтобы исключить зависшие состояния (особенно после deep sleep/неудачных коннектов). [web:114]
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
   WiFi.mode(WIFI_STA);
+
+  WiFi.setAutoReconnect(true);  // полезно при нестабильной точке/шуме [web:111]
+  if (WIFI_DISABLE_SLEEP) WiFi.setSleep(false);
+
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+
   uint32_t t0 = ms();
-  while (WiFi.status() != WL_CONNECTED && (ms() - t0 < timeoutMs)) {
-    delay(50);
+  uint32_t lastPrint = 0;
+
+  while (ms() - t0 < timeoutMs) {
     esp_task_wdt_reset();
+
+    wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED) {
+      wifiTuneAfterConnect();
+      Serial.printf("[WIFI] Connected: IP=%s RSSI=%d\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      return true;
+    }
+
+    // Диагностика статуса подключения (чтобы видеть, WL_NO_SSID_AVAIL/CONNECT_FAILED/…)
+    if (ms() - lastPrint > 500) {
+      lastPrint = ms();
+      Serial.printf("[WIFI] status=%d (%s), elapsed=%u ms\n",
+                    (int)st, wlStatusStr(st), (unsigned)(ms() - t0));
+    }
+
+    // Если аутентификация/подключение явно “сломалось”, выходим раньше таймаута
+    if (st == WL_CONNECT_FAILED) break;
+
+    delay(50);
   }
-  if (WiFi.status() != WL_CONNECTED) return false;
-  wifiTuneAfterConnect();
-  return true;
+
+  wl_status_t st = WiFi.status();
+  Serial.printf("[WIFI] FAIL: status=%d (%s)\n", (int)st, wlStatusStr(st));
+  return false;
 }
 
 static bool syncTimeSNTP() {
@@ -277,7 +320,7 @@ static void startCameraOV2640() {
   Serial.println("[OK] OV2640 UXGA initialized");
 }
 
-// ------------------- API Calls -------------------
+// ------------------- Protocol Calls -------------------
 static bool postHello(int &cycleIdOut, int &delayMsOut) {
   String payload = String("{\"deviceid\":\"") + CAM_ID + "\",\"local_ms\":" + String(ms()) + "}";
   String req =
@@ -300,10 +343,11 @@ static bool postHello(int &cycleIdOut, int &delayMsOut) {
   return true;
 }
 
-static bool waitCmd(int cycleId, int &captureMsOut) {
+static bool waitCmd(int cycleId, int &captureDelayMsOut) {
   uint32_t t0 = ms();
   while (ms() - t0 < CMD_TOTAL_WAIT_MS) {
     esp_task_wdt_reset();
+
     String path = String("/waitcmd?deviceid=") + CAM_ID + "&cycle_id=" + String(cycleId) + "&local_ms=" + String(ms());
     String req =
         String("GET ") + path + " HTTP/1.1\r\n" +
@@ -317,9 +361,10 @@ static bool waitCmd(int cycleId, int &captureMsOut) {
     if (r.body.indexOf("\"type\":\"CAPTURE_AT\"") >= 0) {
       int delay_ms = -1;
       if (!jsonFindInt(r.body, "capture_delay_ms", delay_ms)) return false;
-      captureMsOut = delay_ms;
+      captureDelayMsOut = delay_ms;
       return true;
     }
+
     delay(100);
   }
   return false;
@@ -329,6 +374,7 @@ static bool waitAck(int cycleId, bool &sleepOut) {
   uint32_t t0 = ms();
   while (ms() - t0 < ACK_TOTAL_WAIT_MS) {
     esp_task_wdt_reset();
+
     String path = String("/waitack?deviceid=") + CAM_ID + "&cycle_id=" + String(cycleId);
     String req =
         String("GET ") + path + " HTTP/1.1\r\n" +
@@ -348,11 +394,12 @@ static bool waitAck(int cycleId, bool &sleepOut) {
 }
 
 // ------------------- Resume Upload -------------------
-static bool initUpload(int cycleId, size_t jpegSize, uint32_t jpegCrc, String &transferIdOut, int &resumeFromChunk) {
+static bool initUpload(int cycleId, size_t jpegSize, uint32_t jpegCrc,
+                       String &transferIdOut, int &resumeFromChunk) {
   int chunkCount = (jpegSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
   String payload = String("{") +
-    "\"cam_id\":\"" + CAM_ID + "\"," +
+    "\"cam_id\":\"" + String(CAM_ID) + "\"," +
     "\"cycle_id\":" + String(cycleId) + "," +
     "\"jpeg_size\":" + String(jpegSize) + "," +
     "\"chunk_size\":" + String(CHUNK_SIZE) + "," +
@@ -383,7 +430,8 @@ static bool initUpload(int cycleId, size_t jpegSize, uint32_t jpegCrc, String &t
   return true;
 }
 
-static bool uploadChunk(const String &transferId, int chunkIndex, const uint8_t *data, size_t len) {
+static bool uploadChunk(const String &transferId, int chunkIndex,
+                        const uint8_t *data, size_t len) {
   uint32_t chunkCrc = crc32(data, len);
 
   WiFiClient client;
@@ -492,7 +540,8 @@ static bool uploadImageResumable(camera_fb_t *fb, int cycleId) {
     }
 
     if ((i % 10) == 0 || i == chunkCount - 1) {
-      Serial.printf("[PROGRESS] %d/%d chunks (%.1f%%)\n", i + 1, chunkCount, ((i + 1) * 100.0) / chunkCount);
+      Serial.printf("[PROGRESS] %d/%d chunks (%.1f%%)\n",
+                    i + 1, chunkCount, ((i + 1) * 100.0) / chunkCount);
     }
   }
 
@@ -529,49 +578,65 @@ void setup() {
 
   uint32_t tBoot = ms();
 
+  // WiFi
   uint32_t t0 = ms();
-  if (!connectWiFi(WIFI_TIMEOUT_MS)) goToSleep(FAIL_SLEEP_SEC);
+  if (!connectWiFiDetailed(WIFI_TIMEOUT_MS)) {
+    Serial.println("[ERR] WiFi connect failed -> sleep");
+    goToSleep(FAIL_SLEEP_SEC);
+  }
   Serial.printf("[TIMING] wifi_connect=%u ms rssi=%d\n", (ms() - t0), WiFi.RSSI());
 
+  // SNTP (не критично для синхронной съёмки по delay, но полезно для логов/метаданных)
   t0 = ms();
   bool timeOk = syncTimeSNTP();
   Serial.printf("[TIMING] sntp=%u ms ok=%s\n", (ms() - t0), timeOk ? "true" : "false");
 
+  // HELLO
   int cycleId = -1, captureDelayMs = -1;
   t0 = ms();
-  if (!postHello(cycleId, captureDelayMs)) goToSleep(FAIL_SLEEP_SEC);
+  if (!postHello(cycleId, captureDelayMs)) {
+    Serial.println("[ERR] hello failed -> sleep");
+    goToSleep(FAIL_SLEEP_SEC);
+  }
   Serial.printf("[TIMING] hello=%u ms cycle_id=%d capture_delay=%d\n", (ms() - t0), cycleId, captureDelayMs);
 
+  // WAITCMD
   int cmdCaptureDelayMs = -1;
   t0 = ms();
-  if (!waitCmd(cycleId, cmdCaptureDelayMs)) goToSleep(FAIL_SLEEP_SEC);
+  if (!waitCmd(cycleId, cmdCaptureDelayMs)) {
+    Serial.println("[ERR] waitcmd failed -> sleep");
+    goToSleep(FAIL_SLEEP_SEC);
+  }
   Serial.printf("[TIMING] waitcmd=%u ms capture_delay=%d\n", (ms() - t0), cmdCaptureDelayMs);
 
-  // Синхронная съёмка (не трогаем задумку)
+  // --- СИНХРОННАЯ СЪЁМКА (не меняем принцип) ---
   int waitMs = cmdCaptureDelayMs;
   if (waitMs > 0 && waitMs < 10000) {
     Serial.printf("[SYNC] Waiting %d ms for synchronized capture\n", waitMs);
     delay((uint32_t)waitMs);
   }
 
+  // CAPTURE
   t0 = ms();
   camera_fb_t *fb = esp_camera_fb_get();
   uint32_t captureMs = ms() - t0;
 
   if (!fb) {
-    Serial.println("[ERR] Capture FAILED");
+    Serial.println("[ERR] Capture FAILED -> sleep");
     goToSleep(FAIL_SLEEP_SEC);
   }
   Serial.printf("[TIMING] capture=%u ms jpeg_bytes=%u\n", captureMs, fb->len);
 
+  // UPLOAD
   bool uploaded = uploadImageResumable(fb, cycleId);
   esp_camera_fb_return(fb);
 
   if (!uploaded) {
-    Serial.println("[ERR] Upload FAILED");
+    Serial.println("[ERR] Upload FAILED -> sleep");
     goToSleep(FAIL_SLEEP_SEC);
   }
 
+  // ACK
   bool sleepFlag = false;
   t0 = ms();
   waitAck(cycleId, sleepFlag);
@@ -579,6 +644,7 @@ void setup() {
 
   Serial.printf("[TIMING] total_awake=%u ms\n", (ms() - tBoot));
   digitalWrite(STATUS_LED_GPIO, HIGH);
+
   goToSleep(CAPTURE_PERIOD_SEC);
 }
 
