@@ -3,77 +3,38 @@
 #include <WiFi.h>
 #include <time.h>
 #include <esp_task_wdt.h>
-#include <esp_wifi.h>
 
 // ------------------- CONFIG -------------------
 static const char* WIFI_SSID = "Raspberry";
 static const char* WIFI_PASS = "12345678";
 static const char* SERVER_HOST = "192.168.4.1";
 static const uint16_t SERVER_PORT = 8000;
-
-static const char* CAM_ID = "cam120";   // для второй камеры соберите отдельный бинарник с "cam120"
+static const char* CAM_ID = "cam160";
 
 static const uint32_t CAPTURE_PERIOD_SEC = 600;
 static const uint32_t FAIL_SLEEP_SEC = 120;
+static const uint32_t CHUNK_SIZE = 2048;
+static const uint8_t UPLOAD_MAX_RETRIES = 3;
+static const uint8_t CHUNK_MAX_RETRIES = 5;
 
-static const uint32_t WIFI_TIMEOUT_MS = 30000;
-static const uint8_t  WIFI_CONNECT_ATTEMPTS = 2;
-
+static const uint32_t WIFI_TIMEOUT_MS = 15000;
 static const uint32_t CMD_TOTAL_WAIT_MS = 50000;
 static const uint32_t ACK_TOTAL_WAIT_MS = 60000;
-static const uint32_t SNTPTIMEOUT_MS = 8000;
 
-static const uint32_t HTTP_SOCK_TIMEOUT_MS  = 5000;
+// SNTP: увеличенный таймаут + retry (но необязательный для синхронизации)
+static const uint32_t SNTP_TIMEOUT_MS = 15000;
+static const uint8_t SNTP_MAX_RETRIES = 3;
+
+static const uint32_t HTTP_SOCK_TIMEOUT_MS = 5000;
 static const uint32_t CHUNK_SOCK_TIMEOUT_MS = 8000;
 
 static const bool WIFI_DISABLE_SLEEP = true;
-static const bool WIFI_MAX_TXPOWER   = true;
+static const bool WIFI_MAX_TXPOWER = true;
 
-static const uint32_t CHUNK_SIZE = 2048;
-static const uint8_t  UPLOAD_MAX_RETRIES = 3;
-static const uint8_t  CHUNK_MAX_RETRIES  = 5;
-
-// не называем TCP_MSS (это макрос lwIP)
 static const size_t TCP_WRITE_BLOCK = 1460;
 
-#define LED_FLASH_GPIO   GPIO_NUM_4
-#define STATUS_LED_GPIO  GPIO_NUM_33
-
-// ------------------- WiFi event diagnostics -------------------
-static volatile bool g_wifi_got_ip = false;
-static volatile bool g_wifi_disconnected = false;
-static volatile uint8_t g_wifi_disc_reason = 0;
-
-static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
-  switch (event) {
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      g_wifi_got_ip = true;
-      Serial.printf("[WIFI][EV] GOT_IP: %s\n", IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
-      break;
-
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      g_wifi_disconnected = true;
-      g_wifi_disc_reason = info.wifi_sta_disconnected.reason;
-      Serial.printf("[WIFI][EV] DISCONNECTED: reason=%u\n", (unsigned)g_wifi_disc_reason);
-      break;
-
-    default:
-      break;
-  }
-}
-
-static const char* wlStatusStr(wl_status_t st) {
-  switch (st) {
-    case WL_IDLE_STATUS:      return "WL_IDLE_STATUS";
-    case WL_NO_SSID_AVAIL:    return "WL_NO_SSID_AVAIL";
-    case WL_SCAN_COMPLETED:   return "WL_SCAN_COMPLETED";
-    case WL_CONNECTED:        return "WL_CONNECTED";
-    case WL_CONNECT_FAILED:   return "WL_CONNECT_FAILED";
-    case WL_CONNECTION_LOST:  return "WL_CONNECTION_LOST";
-    case WL_DISCONNECTED:     return "WL_DISCONNECTED";
-    default:                  return "WL_UNKNOWN";
-  }
-}
+#define LED_FLASH_GPIO GPIO_NUM_4
+#define STATUS_LED_GPIO GPIO_NUM_33
 
 // ------------------- CRC32 -------------------
 static uint32_t crc32_table[256];
@@ -83,7 +44,9 @@ static void make_crc32_table() {
   if (crc32_table_computed) return;
   for (uint32_t n = 0; n < 256; n++) {
     uint32_t c = n;
-    for (int k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320UL ^ (c >> 1)) : (c >> 1);
+    for (int k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xedb88320UL ^ (c >> 1)) : (c >> 1);
+    }
     crc32_table[n] = c;
   }
   crc32_table_computed = true;
@@ -92,7 +55,9 @@ static void make_crc32_table() {
 static uint32_t crc32(const uint8_t *buf, size_t len) {
   make_crc32_table();
   uint32_t c = 0xffffffffUL;
-  for (size_t n = 0; n < len; n++) c = crc32_table[(c ^ buf[n]) & 0xff] ^ (c >> 8);
+  for (size_t n = 0; n < len; n++) {
+    c = crc32_table[(c ^ buf[n]) & 0xff] ^ (c >> 8);
+  }
   return c ^ 0xffffffffUL;
 }
 
@@ -101,7 +66,6 @@ static uint32_t ms() { return millis(); }
 
 static void goToSleep(uint32_t seconds) {
   Serial.printf("[SLEEP] %u sec\n", seconds);
-  Serial.flush();
   esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
   esp_deep_sleep_start();
 }
@@ -138,8 +102,8 @@ struct HttpResp {
 
 static bool httpRequestRaw(const String &req, HttpResp &out, uint32_t totalTimeoutMs) {
   out = HttpResp();
-  WiFiClient client;
 
+  WiFiClient client;
   if (!client.connect(SERVER_HOST, SERVER_PORT)) return false;
   client.setTimeout(HTTP_SOCK_TIMEOUT_MS);
 
@@ -170,7 +134,8 @@ static bool httpRequestRaw(const String &req, HttpResp &out, uint32_t totalTimeo
 
   if (contentLen >= 0) {
     while ((int)body.length() < contentLen && (ms() - t0 < totalTimeoutMs)) {
-      while (client.available() && (int)body.length() < contentLen) body += (char)client.read();
+      while (client.available() && (int)body.length() < contentLen)
+        body += (char)client.read();
       if (!client.connected() && !client.available()) break;
       delay(1);
     }
@@ -197,7 +162,8 @@ static bool jsonFindInt(const String &json, const char *key, int &out) {
   colon++;
   while (colon < (int)json.length() && (json[colon] == ' ' || json[colon] == '"')) colon++;
   String num = "";
-  while (colon < (int)json.length() && (isdigit(json[colon]) || json[colon] == '-')) num += json[colon++];
+  while (colon < (int)json.length() && (isdigit(json[colon]) || json[colon] == '-'))
+    num += json[colon++];
   if (num.length() == 0) return false;
   out = num.toInt();
   return true;
@@ -232,152 +198,52 @@ static void wifiTuneAfterConnect() {
   if (WIFI_MAX_TXPOWER) WiFi.setTxPower(WIFI_POWER_19_5dBm);
 }
 
-// -------- scan + best AP selection --------
-static void printScanResult(int n) {
-  Serial.printf("[WIFI] Scan done: %d networks\n", n);
-  for (int i = 0; i < n; i++) {
-    Serial.printf("[WIFI]  %2d) SSID='%s' RSSI=%d ch=%d enc=%d\n",
-                  i + 1,
-                  WiFi.SSID(i).c_str(),
-                  WiFi.RSSI(i),
-                  WiFi.channel(i),
-                  (int)WiFi.encryptionType(i));
-    delay(2);
-  }
-}
-
-struct SsidHit {
-  bool found = false;
-  int channel = 0;
-  int rssi = -999;
-  uint8_t bssid[6] = {0};
-};
-
-static SsidHit findBestAPForSSID(const char* targetSsid) {
-  SsidHit best;
-  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
-  printScanResult(n);
-
-  for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == String(targetSsid)) {
-      int rssi = WiFi.RSSI(i);
-      if (!best.found || rssi > best.rssi) {
-        best.found = true;
-        best.rssi = rssi;
-        best.channel = WiFi.channel(i);
-        const uint8_t* b = WiFi.BSSID(i);
-        if (b) memcpy(best.bssid, b, 6);
-      }
-    }
-  }
-  return best;
-}
-
-static void wifiHardResetSTA() {
-  WiFi.persistent(false);                  // снижает риск лишних записей во flash при циклах сна [page:0]
-  WiFi.disconnect(true);
-  delay(200);
-  WiFi.mode(WIFI_OFF);
-  delay(200);
+static bool connectWiFi(uint32_t timeoutMs) {
   WiFi.mode(WIFI_STA);
-
-  WiFi.setAutoReconnect(true);
-
-  if (WIFI_DISABLE_SLEEP) {
-    WiFi.setSleep(false);
-    esp_wifi_set_ps(WIFI_PS_NONE);         // более жёстко отключаем power save [page:0]
-  }
-
-  if (WIFI_MAX_TXPOWER) WiFi.setTxPower(WIFI_POWER_19_5dBm);
-
-  g_wifi_got_ip = false;
-  g_wifi_disconnected = false;
-  g_wifi_disc_reason = 0;
-}
-
-static bool connectWiFiOnce(bool lockToBssid) {
-  Serial.printf("[WIFI] Connecting to SSID='%s' lockToBssid=%s\n", WIFI_SSID, lockToBssid ? "true" : "false");
-
-  SsidHit hit = findBestAPForSSID(WIFI_SSID);
-  if (hit.found) {
-    Serial.printf("[WIFI] Found: RSSI=%d ch=%d BSSID=%02X:%02X:%02X:%02X:%02X:%02X\n",
-                  hit.rssi, hit.channel,
-                  hit.bssid[0], hit.bssid[1], hit.bssid[2], hit.bssid[3], hit.bssid[4], hit.bssid[5]);
-  } else {
-    Serial.printf("[WIFI] SSID '%s' not found in scan\n", WIFI_SSID);
-  }
-
-  if (hit.found && lockToBssid) {
-    WiFi.begin(WIFI_SSID, WIFI_PASS, hit.channel, hit.bssid, true);
-  } else {
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-  }
-
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0 = ms();
-  uint32_t lastPrint = 0;
-
-  while (ms() - t0 < WIFI_TIMEOUT_MS) {
-    esp_task_wdt_reset();
-
-    if (WiFi.status() == WL_CONNECTED && g_wifi_got_ip) {
-      wifiTuneAfterConnect();
-      Serial.printf("[WIFI] Connected: IP=%s RSSI=%d\n",
-                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
-      return true;
-    }
-
-    if (ms() - lastPrint > 500) {
-      lastPrint = ms();
-      wl_status_t st = WiFi.status();
-      Serial.printf("[WIFI] status=%d (%s), got_ip=%s, elapsed=%u ms\n",
-                    (int)st, wlStatusStr(st), g_wifi_got_ip ? "true" : "false", (unsigned)(ms() - t0));
-    }
-
-    // Если стек уже сообщил DISCONNECTED — выходим раньше и используем reason для диагностики
-    if (g_wifi_disconnected) {
-      Serial.printf("[WIFI] Early exit due to DISCONNECTED event: reason=%u\n", (unsigned)g_wifi_disc_reason);
-      return false;
-    }
-
+  while (WiFi.status() != WL_CONNECTED && (ms() - t0 < timeoutMs)) {
     delay(50);
+    esp_task_wdt_reset();
   }
-
-  wl_status_t st = WiFi.status();
-  Serial.printf("[WIFI] TIMEOUT: status=%d (%s), last_reason=%u\n", (int)st, wlStatusStr(st), (unsigned)g_wifi_disc_reason);
-  return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  wifiTuneAfterConnect();
+  return true;
 }
 
-static bool connectWiFiRobust() {
-  wifiHardResetSTA();
-
-  // 1) попытка с фиксацией BSSID/канала
-  if (connectWiFiOnce(true)) return true;
-
-  // 2) попытка без фиксации BSSID (на случай “не нравится” forced BSSID)
-  Serial.printf("[WIFI] Retry without BSSID lock. last_reason=%u\n", (unsigned)g_wifi_disc_reason);
-  wifiHardResetSTA();
-  if (connectWiFiOnce(false)) return true;
-
-  return false;
-}
-
+// SNTP с retry логикой (необязательный результат)
 static bool syncTimeSNTP() {
   configTime(0, 0, SERVER_HOST);
-  uint32_t t0 = ms();
-  struct tm ti;
-  while (ms() - t0 < SNTPTIMEOUT_MS) {
-    esp_task_wdt_reset();
-    if (getLocalTime(&ti, 200)) return true;
-    delay(50);
+  
+  for (uint8_t attempt = 1; attempt <= SNTP_MAX_RETRIES; attempt++) {
+    uint32_t t0 = ms();
+    struct tm ti;
+    
+    while (ms() - t0 < SNTP_TIMEOUT_MS) {
+      esp_task_wdt_reset();
+      if (getLocalTime(&ti, 200)) {
+        Serial.printf("[SNTP] Synced on attempt %d\n", attempt);
+        return true;
+      }
+      delay(50);
+    }
+    
+    if (attempt < SNTP_MAX_RETRIES) {
+      Serial.printf("[SNTP] Attempt %d failed, retrying...\n", attempt);
+      delay(1000);
+    }
   }
+  
+  Serial.println("[SNTP] All attempts failed, continuing without time sync");
   return false;
 }
 
-// ------------------- Camera Init -------------------
-static void startCameraOV2640() {
+// ------------------- Camera Init OV5640 -------------------
+static void startCameraOV5640() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
+  
   config.pin_d0 = 5;
   config.pin_d1 = 18;
   config.pin_d2 = 19;
@@ -395,7 +261,7 @@ static void startCameraOV2640() {
   config.pin_pwdn = 32;
   config.pin_reset = -1;
 
-  config.xclk_freq_hz = 10000000;
+  config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
   if (!psramFound()) {
@@ -403,7 +269,7 @@ static void startCameraOV2640() {
     while (true) delay(1000);
   }
 
-  config.frame_size = FRAMESIZE_UXGA;
+  config.frame_size = FRAMESIZE_QXGA;
   config.jpeg_quality = 10;
   config.fb_count = 1;
   config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -417,17 +283,27 @@ static void startCameraOV2640() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
     s->set_whitebal(s, 1);
-    s->set_gain_ctrl(s, 1);
+    s->set_awb_gain(s, 1);
     s->set_exposure_ctrl(s, 1);
+    s->set_gain_ctrl(s, 1);
+    s->set_gainceiling(s, (gainceiling_t)2);
     s->set_lenc(s, 1);
     s->set_raw_gma(s, 1);
-    s->set_gainceiling(s, (gainceiling_t)2);
+    s->set_bpc(s, 0);
+    s->set_wpc(s, 1);
+    s->set_hmirror(s, 0);
+    s->set_vflip(s, 0);
   }
-  Serial.println("[OK] OV2640 UXGA initialized");
+  
+  Serial.println("[OK] OV5640 initialized");
+  Serial.printf("[INFO] Resolution: QXGA (2048x1536), XCLK: 20MHz\n");
 }
 
-// ------------------- Protocol Calls -------------------
+// ------------------- API Calls -------------------
 static bool postHello(int &cycleIdOut, int &delayMsOut) {
   String payload = String("{\"deviceid\":\"") + CAM_ID + "\",\"local_ms\":" + String(ms()) + "}";
   String req =
@@ -450,11 +326,10 @@ static bool postHello(int &cycleIdOut, int &delayMsOut) {
   return true;
 }
 
-static bool waitCmd(int cycleId, int &captureDelayMsOut) {
+static bool waitCmd(int cycleId, int &captureMsOut) {
   uint32_t t0 = ms();
   while (ms() - t0 < CMD_TOTAL_WAIT_MS) {
     esp_task_wdt_reset();
-
     String path = String("/waitcmd?deviceid=") + CAM_ID + "&cycle_id=" + String(cycleId) + "&local_ms=" + String(ms());
     String req =
         String("GET ") + path + " HTTP/1.1\r\n" +
@@ -468,7 +343,7 @@ static bool waitCmd(int cycleId, int &captureDelayMsOut) {
     if (r.body.indexOf("\"type\":\"CAPTURE_AT\"") >= 0) {
       int delay_ms = -1;
       if (!jsonFindInt(r.body, "capture_delay_ms", delay_ms)) return false;
-      captureDelayMsOut = delay_ms;
+      captureMsOut = delay_ms;
       return true;
     }
     delay(100);
@@ -480,7 +355,6 @@ static bool waitAck(int cycleId, bool &sleepOut) {
   uint32_t t0 = ms();
   while (ms() - t0 < ACK_TOTAL_WAIT_MS) {
     esp_task_wdt_reset();
-
     String path = String("/waitack?deviceid=") + CAM_ID + "&cycle_id=" + String(cycleId);
     String req =
         String("GET ") + path + " HTTP/1.1\r\n" +
@@ -504,7 +378,7 @@ static bool initUpload(int cycleId, size_t jpegSize, uint32_t jpegCrc, String &t
   int chunkCount = (jpegSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
   String payload = String("{") +
-    "\"cam_id\":\"" + String(CAM_ID) + "\"," +
+    "\"cam_id\":\"" + CAM_ID + "\"," +
     "\"cycle_id\":" + String(cycleId) + "," +
     "\"jpeg_size\":" + String(jpegSize) + "," +
     "\"chunk_size\":" + String(CHUNK_SIZE) + "," +
@@ -582,6 +456,7 @@ static bool uploadChunk(const String &transferId, int chunkIndex, const uint8_t 
 
   statusLine.trim();
   client.stop();
+
   return (statusLine.startsWith("HTTP/1.1 200") || statusLine.startsWith("HTTP/1.0 200"));
 }
 
@@ -605,6 +480,7 @@ static bool uploadImageResumable(camera_fb_t *fb, int cycleId) {
 
   uint32_t jpegCrc = crc32(fb->buf, fb->len);
   int chunkCount = (fb->len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
   Serial.printf("[UPLOAD] JPEG size=%u CRC=0x%08X chunks=%d\n", fb->len, jpegCrc, chunkCount);
 
   String transferId;
@@ -642,8 +518,7 @@ static bool uploadImageResumable(camera_fb_t *fb, int cycleId) {
     }
 
     if ((i % 10) == 0 || i == chunkCount - 1) {
-      Serial.printf("[PROGRESS] %d/%d chunks (%.1f%%)\n",
-                    i + 1, chunkCount, ((i + 1) * 100.0) / chunkCount);
+      Serial.printf("[PROGRESS] %d/%d chunks (%.1f%%)\n", i + 1, chunkCount, ((i + 1) * 100.0) / chunkCount);
     }
   }
 
@@ -658,12 +533,13 @@ static bool uploadImageResumable(camera_fb_t *fb, int cycleId) {
     }
     delay(500 * attempt);
   }
+
   return false;
 }
 
 // ------------------- Main -------------------
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(921600);
   delay(200);
 
   pinMode(LED_FLASH_GPIO, OUTPUT);
@@ -674,70 +550,55 @@ void setup() {
   esp_task_wdt_init(60, true);
   esp_task_wdt_add(NULL);
 
-  WiFi.onEvent(onWiFiEvent);
-
   blinkStatus(2, 120, 120);
-  startCameraOV2640();
+  startCameraOV5640();
 
   uint32_t tBoot = ms();
 
-  // WiFi connect (robust + reason logging)
   uint32_t t0 = ms();
-  if (!connectWiFiRobust()) {
-    Serial.printf("[ERR] WiFi connect failed. last_reason=%u -> sleep\n", (unsigned)g_wifi_disc_reason);
-    goToSleep(FAIL_SLEEP_SEC);
-  }
+  if (!connectWiFi(WIFI_TIMEOUT_MS)) goToSleep(FAIL_SLEEP_SEC);
   Serial.printf("[TIMING] wifi_connect=%u ms rssi=%d\n", (ms() - t0), WiFi.RSSI());
 
-  // SNTP
+  // SNTP необязателен (не прерываем программу при неудаче)
   t0 = ms();
   bool timeOk = syncTimeSNTP();
   Serial.printf("[TIMING] sntp=%u ms ok=%s\n", (ms() - t0), timeOk ? "true" : "false");
 
-  // HELLO
   int cycleId = -1, captureDelayMs = -1;
   t0 = ms();
-  if (!postHello(cycleId, captureDelayMs)) {
-    Serial.println("[ERR] hello failed -> sleep");
-    goToSleep(FAIL_SLEEP_SEC);
-  }
+  if (!postHello(cycleId, captureDelayMs)) goToSleep(FAIL_SLEEP_SEC);
   Serial.printf("[TIMING] hello=%u ms cycle_id=%d capture_delay=%d\n", (ms() - t0), cycleId, captureDelayMs);
 
-  // WAITCMD
   int cmdCaptureDelayMs = -1;
   t0 = ms();
-  if (!waitCmd(cycleId, cmdCaptureDelayMs)) {
-    Serial.println("[ERR] waitcmd failed -> sleep");
-    goToSleep(FAIL_SLEEP_SEC);
-  }
+  if (!waitCmd(cycleId, cmdCaptureDelayMs)) goToSleep(FAIL_SLEEP_SEC);
   Serial.printf("[TIMING] waitcmd=%u ms capture_delay=%d\n", (ms() - t0), cmdCaptureDelayMs);
 
-  // --- СИНХРОННАЯ СЪЁМКА (принцип сохранён) ---
+  // Синхронная съёмка
   int waitMs = cmdCaptureDelayMs;
   if (waitMs > 0 && waitMs < 10000) {
     Serial.printf("[SYNC] Waiting %d ms for synchronized capture\n", waitMs);
     delay((uint32_t)waitMs);
   }
 
-  // CAPTURE
   t0 = ms();
   camera_fb_t *fb = esp_camera_fb_get();
   uint32_t captureMs = ms() - t0;
+
   if (!fb) {
-    Serial.println("[ERR] Capture FAILED -> sleep");
+    Serial.println("[ERR] Capture FAILED");
     goToSleep(FAIL_SLEEP_SEC);
   }
   Serial.printf("[TIMING] capture=%u ms jpeg_bytes=%u\n", captureMs, fb->len);
 
-  // UPLOAD
   bool uploaded = uploadImageResumable(fb, cycleId);
   esp_camera_fb_return(fb);
+
   if (!uploaded) {
-    Serial.println("[ERR] Upload FAILED -> sleep");
+    Serial.println("[ERR] Upload FAILED");
     goToSleep(FAIL_SLEEP_SEC);
   }
 
-  // ACK
   bool sleepFlag = false;
   t0 = ms();
   waitAck(cycleId, sleepFlag);
