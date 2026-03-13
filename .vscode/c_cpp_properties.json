@@ -8,8 +8,8 @@
         {
             "name": "PlatformIO",
             "includePath": [
-                "c:/Users/Meteo/Documents/esp32cam/include",
-                "c:/Users/Meteo/Documents/esp32cam/src",
+                "c:/WorkSpace/Project/1. CloudCam/include",
+                "c:/WorkSpace/Project/1. CloudCam/src",
                 "C:/Users/Meteo/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                 "C:/Users/Meteo/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/newlib/platform_include",
                 "C:/Users/Meteo/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/freertos/include",
@@ -244,8 +244,8 @@
             "browse": {
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
-                    "c:/Users/Meteo/Documents/esp32cam/include",
-                    "c:/Users/Meteo/Documents/esp32cam/src",
+                    "c:/WorkSpace/Project/1. CloudCam/include",
+                    "c:/WorkSpace/Project/1. CloudCam/src",
                     "C:/Users/Meteo/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                     "C:/Users/Meteo/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/newlib/platform_include",
                     "C:/Users/Meteo/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/freertos/include",
